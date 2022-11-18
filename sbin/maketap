@@ -1,0 +1,191 @@
+#!/usr/bin/python
+
+import argparse
+import getpass
+import os
+import pathlib
+import socket
+import subprocess
+import sys
+
+def run(cmd: list[str]) -> None:
+    """Run the given command in a subprocess.
+
+    Output is hidden, if the return code of the command is not 0, then an
+    exception is thrown.
+
+    Args:
+        cmd: list[str]
+           Command to run, as a list of string containing the binary to run
+           and the arguments.
+    """
+
+    subprocess.run(cmd, capture_output=True, check=True)
+
+def die(msg: str) -> None:
+    """Print a message and exits the application.
+
+    Args:
+        msg: str
+            Message to print before exiting.
+    """
+
+    print(msg)
+    sys.exit(-1)
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse the application's arguments and return them.
+
+    Returns:
+        argparse's namespace containing all the argument provided by the user.
+    """
+
+    parser = argparse.ArgumentParser(prog="maketap")
+
+    # Bridge settings
+    parser.add_argument("-b", "--bridge", type=str, required=True,
+        help="Name to assign to the bridge device.")
+
+    b_exclusive_group = parser.add_mutually_exclusive_group(required=True)
+    b_exclusive_group.add_argument("--bridge-use-dhcp", action="store_true",
+        help="Request IP address for the bridge through DHCP.")
+    b_exclusive_group.add_argument("--bridge-ip", type=str, default=None,
+        help="IP address to assign to the bridge.")
+    parser.add_argument("--bridge-route", type=str, default=None,
+        help="Network to set as default going through the bridge.")
+    parser.add_argument("--bridge-dns", type=str, default=None,
+        help="Bridge's DNS server. Use this option if --bridge-dhcp is not able "
+        "to set the DNS through resolvectl.")
+
+    # WAN interface settings
+    parser.add_argument("-w", "--wan", type=str, default=None,
+        help="WAN interface to bridge to, for network access. Optional.")
+
+    # TAP interface settings
+    parser.add_argument("-t", "--tap", type=str, required=True,
+        help="TAP interface name.")
+    parser.add_argument("--tap-owner", type=str, default="root",
+        help="User name owning the TAP.")
+    parser.add_argument("--tap-mq", action="store_true",
+        help="If true, enable multi-queue support on the TAP device.")
+
+    return parser.parse_args()
+
+class Device:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def create(self) -> None:
+        pass
+
+    def down(self) -> None:
+        print(f"Bringing {self.name} down")
+        run(["ip", "link", "set", self.name, "down"])
+
+    def up(self) -> None:
+        print(f"Bringing {self.name} up")
+        run(["ip", "link", "set", self.name, "up"])
+
+    def request_ip(self) -> None:
+        print(f"Requesting IP for {self}")
+        run(["dhclient", "-H", socket.gethostname(), self.name])
+
+    def set_ip(self, ip: str) -> None:
+        print(f"Setting IP {ip} to {self}")
+        run(["ip", "addr", "add", ip, "dev", self.name])
+
+    def set_dns(self, dns: str) -> None:
+        print(f"Setting DNS {dns} to {self}")
+        run(["resolvectl", "dns", self.name, dns])
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def flush(self) -> None:
+        print(f"Flushing {self}")
+        run(["ip", "addr", "flush", "dev", self.name])
+
+    def __str__(self) -> str:
+        return self.name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def path(self) -> pathlib.Path:
+        return pathlib.Path(f"/sys/class/net/{self.name}")
+
+class Bridge(Device):
+    def __init__(self, name: str) -> None:
+        super().__init__(name=name)
+
+    def create(self) -> None:
+        print(f"Creating bridge device {self}")
+        run(["ip", "link", "add", self.name, "type", "bridge"])
+
+    def add_slave(self, device: Device) -> None:
+        print(f"Set {device.name} master to {self}")
+        run(["ip", "link", "set", device.name, "master", self.name])
+
+
+class Tap(Device):
+    def __init__(self, name: str, owner: str = "root", multi_queue: bool = False) -> None:
+        super().__init__(name=name)
+        self._owner = owner
+        self._multi_queue = multi_queue
+
+    def create(self) -> None:
+        print(f"Creating TAP device {self}")
+
+        cmd = [
+            "ip", "tuntap", "add",
+            "dev", self.name,
+            "mode", "tap",
+            "user", self._owner
+        ]
+
+        if self._multi_queue:
+            cmd += ["multi_queue"]
+
+        run(cmd)
+
+def main():
+    args = parse_arguments()
+
+    b = Bridge(args.bridge)
+    t = Tap(args.tap, owner=args.tap_owner, multi_queue=args.tap_mq)
+    if b.exists() or t.exists():
+        die(f"{b} and {t} must not exist")
+
+    # Create bridge and bring it up.
+    b.create()
+    b.up()
+
+    # Add WAN interface as a slave, if any.
+    if args.wan:
+        w = Device(args.wan)
+        w.up()
+        b.add_slave(w)
+        w.flush()
+    else:
+        print("No WAN interface defined, TAP device won't be able to access outside network")
+
+    if args.bridge_ip:
+        b.set_ip(args.bridge_ip)
+
+        if args.bridge_route:
+            print(f"Setting default route via {args.bridge_route} on {b}")
+            run(["ip", "route", "add", "default", "via", args.bridge_route, "dev", b.name])
+    else:
+        b.request_ip()
+
+    if args.bridge_dns:
+        b.set_dns(args.bridge_dns)
+
+    # Create TAP device, and add it as a slave.
+    t.create()
+    b.add_slave(t)
+
+if __name__ == "__main__":
+    main()
