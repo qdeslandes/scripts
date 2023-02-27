@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+
+'''
+save_thunderbird - Backup Thunderbird's application and configuration files to
+prevent Chef to remove them.
+
+During my local Chef run, a specific cookbook is responsible for killing
+and removing Thunderbird application, and its configuration. This is an issue
+as it shouldn't behave this way on my laptop, for a lot of reasons.
+
+Instead of fixing the cookbook, which I can't do, I'll work around it.
+
+This works exclusively on MacOS.
+'''
+
+import argparse
+import os
+import pathlib
+import subprocess
+import sys
+
+def error(msg: str) -> None:
+    '''Print an error message.
+
+    Prefixes the messages with '[-]' to imply the failure.
+
+    Args:
+        msg: str
+            Message to print.
+    '''
+
+    print(f'\x1b[31m\033[1m[-]\x1b[0m {msg}')
+
+def success(msg: str) -> None:
+    '''Print a success message.
+
+    Prefixes the messages with '[+]' to imply the success.
+
+    Args:
+        msg: str
+            Message to print.
+    '''
+
+    print(f'\x1b[32m\033[1m[+]\x1b[0m {msg}')
+
+def get_services_status(domain: str = 'system'):
+    '''Fetch the list of services and their status.
+    '''
+
+    process = subprocess.run(['launchctl', 'print-disabled', domain],
+                             check=True, stdout=subprocess.PIPE)
+
+    services = {}
+    raw = process.stdout.decode('utf-8').split('\n')
+    for rawline in raw:
+        if not '=>' in rawline:
+            continue
+
+        components = rawline.strip().split(' ')
+        name = components[0][1:-1]
+        state = components[2]
+        services[name] = True if state == 'enabled' else False
+
+    return services
+
+class Chef:
+    '''Chef object for convenience methods.
+    '''
+
+    CRON_OVERRIDE_PATH = pathlib.Path('/var/chef/cron.default.override')
+
+    def run(self) -> None:
+        '''Run soloctl and wait for completion.
+        '''
+
+        subprocess.run(['soloctl', '-i'], check=True, capture_output=True)
+
+    def prevent_start(self) -> None:
+        '''Prevent Chef from starting by itself.
+
+        This requires calling `stop_chef_temporarily` with a given duration.
+        However, the duration is not actually enforced. `stop_chef_temporarily`
+        will only create `/var/chef/cron.default.override` which effectively
+        prevents Chef from running.
+
+        However, this won't be enough by itself, as launchctl service
+        `system/com.chef.chefctl-override-remove` will run regularly, and remove
+        `/var/chef/cron.default.override` if the file is older than 60 minutes.
+        Hence, we also need to disable this service from running.
+        '''
+
+        subprocess.run(['launchctl', 'disable', 'system/com.chef.chefctl-override-remove'],
+                       check=False, capture_output=True)
+        subprocess.run(['stop_chef_temporarily', '-t', '168'], check=True,
+                       capture_output=True)
+
+    @property
+    def is_running(self) -> bool:
+        '''Check if soloctl is currently running.
+        '''
+
+        return not subprocess.run(['pgrep', '-f', 'soloctl'], check=False)
+
+    @property
+    def is_enabled(self) -> bool:
+        '''Check if soloctl will run if started.
+        '''
+
+        return not Chef.CRON_OVERRIDE_PATH.exists()
+
+    @property
+    def is_soloctl_service_enabled(self) -> bool:
+        '''Check if launchctl's com.chef.soloctl service is enabled.
+
+        Returns:
+            True is com.chef.soloctl service is enabled, False otherwise.
+        '''
+
+        return get_services_status().get('com.chef.soloctl', False)
+
+    @property
+    def is_override_removal_service_enabled(self) -> bool:
+        '''Check if launchctl's com.chef.chefctl-override-remove service is enabled.
+
+        Returns:
+            True if com.chef.chefctl-override-remove is enabled, False otherwise.
+        '''
+
+        return get_services_status().get('com.chef.chefctl-override-remove', False)
+
+
+class Thunderbird:
+    '''Thunderbird object for convenience methods.
+    '''
+
+    APP_PATH = pathlib.Path('/Applications/Thunderbird.app')
+    CONFIG_PATH = pathlib.Path('/Users/qdeslandes/Library/Thunderbird')
+
+    def __init__(self) -> None:
+        if not Thunderbird.APP_PATH.exists():
+            raise RuntimeError(f'{Thunderbird.APP_PATH} doesn\'t exists!')
+        if not Thunderbird.CONFIG_PATH.exists():
+            raise RuntimeError(f'{Thunderbird.CONFIG_PATH} doesn\'t exists!')
+
+    def start(self) -> None:
+        '''Start Thunderbird.
+        '''
+
+        subprocess.run(['open', '/Applications/Thunderbird.app'], check=True)
+
+    def stop(self) -> None:
+        '''Stop Thunderbird.
+        '''
+
+        subprocess.run(['osascript', '-e', 'quit app "Thunderbird"'], check=True)
+
+    def backup(self) -> None:
+        '''Backup Thunderbird's app and data.
+        '''
+
+        os.rename(
+            Thunderbird.APP_PATH.as_posix(),
+            Thunderbird.APP_PATH.as_posix() + '.bak'
+        )
+
+        os.rename(
+            Thunderbird.CONFIG_PATH.as_posix(),
+            Thunderbird.CONFIG_PATH.as_posix() + '.bak'
+        )
+
+    def restore(self) -> None:
+        '''Restore Thunderbird's app and data.
+        '''
+
+        os.rename(
+            Thunderbird.APP_PATH.as_posix() + '.bak',
+            Thunderbird.APP_PATH.as_posix()
+        )
+
+        os.rename(
+            Thunderbird.CONFIG_PATH.as_posix() + '.bak',
+            Thunderbird.CONFIG_PATH.as_posix()
+        )
+
+
+def run_check(chef: Chef, thunderbird: Thunderbird) -> None:
+    '''Run check regarding the system's state.
+
+    This function should not be used as a requirement check. It's designed to
+    verify whether the system is configured properly to avoid losing
+    Thunderbird's configuration.
+
+    Args:
+        chef: Chef
+            Chef object.
+        thunderbird: Thunderbird
+            Thunderbird object.
+    '''
+
+    if sys.platform == 'darwin':
+        success('System is MacOS compatible')
+    else:
+        error('System is not MacOS compatible')
+
+    if chef.is_enabled:
+        error(f'Chef is enabled: \'{Chef.CRON_OVERRIDE_PATH}\' does not exists')
+    else:
+        success(f'Chef is disabled: \'{Chef.CRON_OVERRIDE_PATH}\' does exists')
+
+    if chef.is_soloctl_service_enabled:
+        success('\'com.chef.soloctl\' service enabled')
+    else:
+        error('\'com.chef.soloctl\' service disabled')
+
+    if chef.is_override_removal_service_enabled:
+        error('\'com.chef.chefctl-override-remove\' service enabled')
+    else:
+        success('\'com.chef.chefctl-override-remove\' service disabled')
+
+    if thunderbird.APP_PATH.exists():
+        success('Thunderbird is installed')
+    else:
+        error('Thunderbird is not installed')
+
+    if thunderbird.CONFIG_PATH.exists():
+        success('Thunderbird is configured')
+    else:
+        error('Thunderbird is not configured')
+
+def main() -> None:
+    '''Main function.
+    '''
+
+    parser = argparse.ArgumentParser(description='Workaround Chef\'s Thunderbird removal.')
+    parser.add_argument('-c', '--check', action='store_true',
+                        help='Check system state, do not perform any modification.')
+    parser.add_argument('-s', '--start', action='store_true',
+                        help='Start Thunderbird once run is complete.')
+    args = parser.parse_args()
+
+    chef = Chef()
+    thunderbird = Thunderbird()
+
+    if args.check:
+        run_check(chef, thunderbird)
+        return
+
+    if os.getuid() != 0:
+        raise RuntimeError('Please, run as root')
+
+    if chef.is_enabled:
+        raise RuntimeError('Chef is not supposed to be enabled...')
+    if chef.is_running:
+        raise RuntimeError('Chef is not supposed to be running...')
+
+    success('Stopping and backing-up Thunderbird...')
+    thunderbird.stop()
+    thunderbird.backup()
+
+    success('Running Chef...')
+    chef.run()
+    chef.prevent_start()
+
+    success('Restoring Thunderbird configuration...')
+    thunderbird.restore()
+
+    if args.start:
+        success('Starting Thunderbird back!')
+        thunderbird.start()
+
+if __name__ == '__main__':
+    main()
