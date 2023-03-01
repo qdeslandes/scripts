@@ -16,8 +16,10 @@ This works exclusively on MacOS.
 import argparse
 import os
 import pathlib
+import plistlib
 import subprocess
 import sys
+import time
 
 def error(msg: str) -> None:
     '''Print an error message.
@@ -68,6 +70,9 @@ class Chef:
     '''
 
     CRON_OVERRIDE_PATH = pathlib.Path('/var/chef/cron.default.override')
+    LAUNCHCTL_SERVICE_PLIST = pathlib.Path('/Library/LaunchDaemons/com.chef.soloctl.plist')
+    LAUNCHD_SOLOCTL_BIN_PATH = pathlib.Path('/usr/local/bin/launchd_soloctl.sh')
+    LAUNCHD_SOLOCT_BIN_OVERRIDE = b'#!/bin/bash\ntrue\n'
 
     def run(self) -> None:
         '''Run soloctl and wait for completion.
@@ -75,59 +80,91 @@ class Chef:
 
         subprocess.run(['soloctl', '-i'], check=True, capture_output=True)
 
-    def prevent_start(self) -> None:
-        '''Prevent Chef from starting by itself.
+    def _service_reload(self) -> None:
+        '''Reload the service.
 
-        This requires calling `stop_chef_temporarily` with a given duration.
-        However, the duration is not actually enforced. `stop_chef_temporarily`
-        will only create `/var/chef/cron.default.override` which effectively
-        prevents Chef from running.
-
-        However, this won't be enough by itself, as launchctl service
-        `system/com.chef.chefctl-override-remove` will run regularly, and remove
-        `/var/chef/cron.default.override` if the file is older than 60 minutes.
-        Hence, we also need to disable this service from running.
+        Emulate launchctl's reload command using unload and reload.
         '''
 
-        subprocess.run(['launchctl', 'disable', 'system/com.chef.chefctl-override-remove'],
-                       check=False, capture_output=True)
-        subprocess.run(['stop_chef_temporarily', '-t', '168'], check=True,
-                       capture_output=True)
+        subprocess.run(['launchctl', 'unload', Chef.LAUNCHCTL_SERVICE_PLIST.as_posix()],
+                       check=True, capture_output=True)
+        subprocess.run(['launchctl', 'load', Chef.LAUNCHCTL_SERVICE_PLIST.as_posix()],
+                       check=True, capture_output=True)
+
+    def disable(self) -> None:
+        '''Disable Chef service.
+
+        Modify the service's .plist file to ensure `RunAtLoad` is disabled,
+        and modify the wrapper used by the service to a no-op.
+        '''
+
+        with open(Chef.LAUNCHD_SOLOCTL_BIN_PATH, 'wb') as launchd_soloctl:
+            launchd_soloctl.write(Chef.LAUNCHD_SOLOCT_BIN_OVERRIDE)
+
+        data = self._service_plist
+        data['RunAtLoad'] = False
+        self._service_plist = data
+        self._service_reload()
+
+    @property
+    def _service_plist(self):
+        '''Get the service's .plist file.
+
+        Returns:
+            Dictionnary with the .plist file data.
+        '''
+
+        with open(Chef.LAUNCHCTL_SERVICE_PLIST, 'rb') as plist:
+            return plistlib.load(plist, fmt=plistlib.PlistFormat.FMT_XML)
+
+    @_service_plist.setter
+    def _service_plist(self, data) -> None:
+        '''Set the service's .plist file.
+
+        Args:
+            data
+                Content of the .plist file, as used by plistlib.
+        '''
+
+        with open(Chef.LAUNCHCTL_SERVICE_PLIST, 'wb') as plist:
+            plistlib.dump(data, plist, fmt=plistlib.PlistFormat.FMT_XML)
 
     @property
     def is_running(self) -> bool:
         '''Check if soloctl is currently running.
+
+        Returns:
+            True if Chef is running, False otherwise.
         '''
 
         return not subprocess.run(['pgrep', '-f', 'soloctl'], check=False)
 
     @property
-    def is_enabled(self) -> bool:
-        '''Check if soloctl will run if started.
-        '''
+    def will_run_with_launchd_soloctl(self) -> bool:
+        '''Check whether soloctl will run, eventually.
 
-        return not Chef.CRON_OVERRIDE_PATH.exists()
-
-    @property
-    def is_soloctl_service_enabled(self) -> bool:
-        '''Check if launchctl's com.chef.soloctl service is enabled.
+        Check the content of the wrapper run by com.chef.soloctl to ensure
+        it's a no-op.
 
         Returns:
-            True is com.chef.soloctl service is enabled, False otherwise.
+            True if soloctl will run, False otherwise.
         '''
 
-        return get_services_status().get('com.chef.soloctl', False)
+        with open(Chef.LAUNCHD_SOLOCTL_BIN_PATH, 'rb') as launchd_soloctl:
+            return len(launchd_soloctl.readlines()) != 2
 
     @property
-    def is_override_removal_service_enabled(self) -> bool:
-        '''Check if launchctl's com.chef.chefctl-override-remove service is enabled.
+    def will_run_at_boot(self) -> bool:
+        '''Check whether com.chef.soloctl will run at boot.
+
+        Check the service's RunAtLoad attribute to find if it will run
+        at boot.
 
         Returns:
-            True if com.chef.chefctl-override-remove is enabled, False otherwise.
+            True if the service will run at boot, False otherwise.
         '''
 
-        return get_services_status().get('com.chef.chefctl-override-remove', False)
-
+        return self._service_plist['RunAtLoad']
 
 class Thunderbird:
     '''Thunderbird object for convenience methods.
@@ -152,7 +189,12 @@ class Thunderbird:
         '''Stop Thunderbird.
         '''
 
-        subprocess.run(['osascript', '-e', 'quit app "Thunderbird"'], check=True)
+        subprocess.run(['osascript', '-e', 'quit app "Thunderbird"'],
+                       check=True, capture_output=True)
+
+        # Ensure Thunderbird is closed before we continue, otherwise it will
+        # create a new ~/Library/Thunderbird folder.
+        time.sleep(1)
 
     def backup(self) -> None:
         '''Backup Thunderbird's app and data.
@@ -182,7 +224,6 @@ class Thunderbird:
             Thunderbird.CONFIG_PATH.as_posix()
         )
 
-
 def run_check(chef: Chef, thunderbird: Thunderbird) -> None:
     '''Run check regarding the system's state.
 
@@ -202,20 +243,16 @@ def run_check(chef: Chef, thunderbird: Thunderbird) -> None:
     else:
         error('System is not MacOS compatible')
 
-    if chef.is_enabled:
-        error(f'Chef is enabled: \'{Chef.CRON_OVERRIDE_PATH}\' does not exists')
+    if chef.will_run_with_launchd_soloctl:
+        error(f'Chef will run eventually: \'{Chef.LAUNCHD_SOLOCTL_BIN_PATH}\' ' \
+              'has not been modified')
     else:
-        success(f'Chef is disabled: \'{Chef.CRON_OVERRIDE_PATH}\' does exists')
+        success(f'Chef won\'t run: \'{Chef.LAUNCHD_SOLOCTL_BIN_PATH}\' has been modified')
 
-    if chef.is_soloctl_service_enabled:
-        success('\'com.chef.soloctl\' service enabled')
+    if chef.will_run_at_boot:
+        error('Chef will run at boot: \'RunAtLoad\' is enabled for \'com.chef.soloctl\'')
     else:
-        error('\'com.chef.soloctl\' service disabled')
-
-    if chef.is_override_removal_service_enabled:
-        error('\'com.chef.chefctl-override-remove\' service enabled')
-    else:
-        success('\'com.chef.chefctl-override-remove\' service disabled')
+        success('Chef won\'t run at boot: \'RunAtLoad\' is disabled for \'com.chef.soloctl\'')
 
     if thunderbird.APP_PATH.exists():
         success('Thunderbird is installed')
@@ -245,11 +282,6 @@ def main() -> None:
         run_check(chef, thunderbird)
         return
 
-    if os.getuid() != 0:
-        raise RuntimeError('Please, run as root')
-
-    if chef.is_enabled:
-        raise RuntimeError('Chef is not supposed to be enabled...')
     if chef.is_running:
         raise RuntimeError('Chef is not supposed to be running...')
 
@@ -259,7 +291,7 @@ def main() -> None:
 
     success('Running Chef...')
     chef.run()
-    chef.prevent_start()
+    chef.disable()
 
     success('Restoring Thunderbird configuration...')
     thunderbird.restore()
