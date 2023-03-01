@@ -21,6 +21,20 @@ import subprocess
 import sys
 import time
 
+def ensure_root() -> None:
+    '''Ensure current UID is 0, raise an exception otherwise.
+    '''
+
+    if os.geteuid() != 0:
+        raise RuntimeError('Please, run as root')
+
+def ensure_macos() -> None:
+    '''Ensure current platform is Darwin, raise an exception otherwise.
+    '''
+
+    if sys.platform != 'darwin':
+        raise RuntimeError('This script is designed for MacOS compatible systems')
+
 def error(msg: str) -> None:
     '''Print an error message.
 
@@ -282,6 +296,8 @@ def main() -> None:
         run_check(chef, thunderbird)
         return
 
+    ensure_root()
+    ensure_macos()
     if chef.is_running:
         raise RuntimeError('Chef is not supposed to be running...')
 
