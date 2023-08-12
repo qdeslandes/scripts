@@ -1,0 +1,11 @@
+#!/bin/sh
+
+AUTOASKPWD_PATH="$HOME/.local/bin/autoaskpwd"
+
+if [ ! -f "$AUTOASKPWD_PATH" ]
+then
+    echo "$AUTOASKPWD_PATH is missing"
+	exit 1
+fi
+
+SUDO_ASKPASS=$AUTOASKPWD_PATH sudo -A /usr/bin/gdb "$@"
